@@ -101,7 +101,16 @@ def parse_json_response(text: str) -> list:
 # ── Gemini ────────────────────────────────────────────────────────────────────
 
 def init_gemini() -> genai.Client:
-    return genai.Client(api_key=os.environ['GEMINI_API_KEY'])
+    client = genai.Client(api_key=os.environ['GEMINI_API_KEY'])
+    try:
+        models = client.models.list()
+        print('[Available models:]')
+        for m in models:
+            if 'generateContent' in (m.supported_actions or []):
+                print(f'  {m.name}')
+    except Exception as e:
+        print(f'[WARN] Could not list models: {e}')
+    return client
 
 
 MODELS = ['gemini-3.1-flash-lite', 'gemini-2.5-flash-lite', 'gemini-2.5-flash']
