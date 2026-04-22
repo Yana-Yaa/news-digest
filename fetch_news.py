@@ -113,19 +113,20 @@ def init_gemini() -> genai.Client:
     return client
 
 
-MODELS = ['gemini-3.1-flash-lite', 'gemini-2.5-flash-lite', 'gemini-2.5-flash']
+MODELS = ['gemini-3.1-flash-lite-preview', 'gemini-2.5-flash-lite', 'gemini-2.5-flash']
 
 
 def _call(client, prompt: str) -> str:
     time.sleep(5)
+    last_err = None
     for model in MODELS:
         for attempt in range(2):
             try:
-                response = client.models.generate_content(
-                    model=model, contents=prompt)
+                response = client.models.generate_content(model=model, contents=prompt)
                 print(f'  [Gemini OK] model={model}')
                 return response.text.strip()
             except Exception as e:
+                last_err = e
                 msg = str(e)
                 if '429' in msg:
                     m = re.search(r'"retryDelay":\s*"(\d+)s"', msg)
@@ -134,12 +135,8 @@ def _call(client, prompt: str) -> str:
                     time.sleep(wait)
                 else:
                     print(f'  [ERROR] {model}: {msg[:120]}')
-                    break  # non-rate-limit error, try next model
-        else:
-            continue  # both attempts rate-limited, try next model
-        break  # success
-    else:
-        raise RuntimeError('All Gemini models rate-limited')
+                break  # try next model on any error
+    raise RuntimeError(f'All models failed. Last error: {last_err}')
 
 
 def _fetch_article_text(url: str) -> str:
