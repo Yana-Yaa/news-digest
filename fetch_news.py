@@ -20,9 +20,15 @@ import requests
 import trafilatura
 from google import genai
 
-TOP_FINNISH    = 8
-TOP_GLOBAL     = 12
-FETCH_PER_SOURCE = 8   # fetch more candidates, Gemini picks the best
+TOP_FINNISH      = 8
+TOP_GLOBAL       = 12
+FETCH_PER_SOURCE = 8
+
+BROWSER_HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 '
+                  '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+}
 
 FEEDS = {
     'Finnish': [
@@ -42,11 +48,12 @@ FEEDS = {
         ('NPR',            'https://feeds.npr.org/1001/rss.xml'),
         ('Financial Times','https://www.ft.com/rss/home/uk'),
     ],
-    'Social': [
-        ('r/Finland', 'https://www.reddit.com/r/Finland/top.rss?t=day'),
-        ('r/Suomi',   'https://www.reddit.com/r/Suomi/top.rss?t=day'),
-    ],
 }
+
+REDDIT_FEEDS = [
+    ('r/Finland', 'https://www.reddit.com/r/Finland/top.rss?t=day'),
+    ('r/Suomi',   'https://www.reddit.com/r/Suomi/top.rss?t=day'),
+]
 
 CSS = '''
 body { font-family: Georgia, serif; font-size: 1.15em; margin: 1.5em; line-height: 1.8; color: #111; }
@@ -78,13 +85,17 @@ def buzz_to_html(text: str) -> str:
         line = line.strip()
         if not line:
             continue
-        # Bold **text** → <strong>
         line = re.sub(r'\*\*(.+?)\*\*', r'<strong>\1</strong>', line)
         if re.match(r'^\d+\.', line):
             parts.append(f'<h3>{line}</h3>')
         else:
             parts.append(f'<p>{line}</p>')
     return ''.join(parts)
+
+
+def parse_json_response(text: str) -> list:
+    text = re.sub(r'^```(?:json)?\s*|\s*```$', '', text.strip(), flags=re.MULTILINE)
+    return json.loads(text)
 
 
 # ── Gemini ────────────────────────────────────────────────────────────────────
@@ -94,168 +105,121 @@ def init_gemini() -> genai.Client:
 
 
 def _call(client, prompt: str) -> str:
+    time.sleep(5)
     for attempt in range(3):
         try:
-            time.sleep(4)   # 15 RPM = 1 req/4s
             response = client.models.generate_content(
                 model='gemini-2.0-flash-lite', contents=prompt)
             return response.text.strip()
         except Exception as e:
             msg = str(e)
-            if '429' in msg and 'retryDelay' in msg:
+            if '429' in msg:
                 m = re.search(r'"retryDelay":\s*"(\d+)s"', msg)
-                wait = int(m.group(1)) + 5 if m else 60
-                print(f'[RATE LIMIT] waiting {wait}s...')
+                wait = int(m.group(1)) + 5 if m else 30
+                print(f'[RATE LIMIT] waiting {wait}s (attempt {attempt+1}/3)...')
                 time.sleep(wait)
             else:
                 raise
-    raise RuntimeError('Gemini rate limit: too many retries')
+    raise RuntimeError('Gemini: too many rate limit retries')
 
 
-def rank_articles(client, articles: list, top_n: int, section: str) -> list:
-    """One Gemini call: select top_n most important unique articles."""
-    lines = [f"{i}: {a['title']} — {a['summary'][:120]}"
-             for i, a in enumerate(articles)]
-    prompt = (
-        f"You are a news editor. From these {len(articles)} {section} articles "
-        f"select the {top_n} most important and unique stories. "
-        f"Merge duplicates (same event from multiple sources — keep one). "
-        f"Return ONLY a JSON array of integer indices in importance order, e.g. [3,0,7].\n\n"
-        + '\n'.join(lines)
-    )
+def _fetch_article_text(url: str) -> str:
     try:
-        text = _call(client, prompt)
-        m = re.search(r'\[[\d,\s]+\]', text)
-        if m:
-            indices = json.loads(m.group())
-            seen, result = set(), []
-            for i in indices:
-                if i < len(articles) and i not in seen:
-                    seen.add(i)
-                    result.append(articles[i])
-            return result[:top_n]
-    except Exception as e:
-        print(f'[WARN] Ranking failed: {e}')
-    return articles[:top_n]
+        resp = requests.get(url, timeout=5, headers={'User-Agent': 'Mozilla/5.0'})
+        return trafilatura.extract(resp.text, include_comments=False,
+                                   include_tables=False, no_fallback=False) or ''
+    except Exception:
+        return ''
 
 
-def _fetch_article_text(url: str, retries: int = 2) -> str:
-    """Download article with timeout and extract clean text. Retries on connection errors."""
-    for attempt in range(retries + 1):
-        try:
-            resp = requests.get(url, timeout=5,
-                                headers={'User-Agent': 'Mozilla/5.0'})
-            text = trafilatura.extract(resp.text, include_comments=False,
-                                       include_tables=False, no_fallback=False)
-            return text or ''
-        except requests.exceptions.Timeout:
-            return ''   # no point retrying a slow site
-        except requests.exceptions.ConnectionError:
-            if attempt < retries:
-                time.sleep(2)
-        except Exception:
-            return ''
-    return ''
-
-
-def summarize_batch(client, articles: list, translate: bool = False) -> list:
-    """Fetch all article texts, then summarize entire batch in ONE Gemini call."""
-    print(f'  Fetching {len(articles)} article pages in parallel...')
+def process_section(client, candidates: list, top_n: int,
+                    section: str, translate: bool = False) -> list:
+    """Fetch article content, then rank + summarize in ONE Gemini call."""
+    print(f'  Fetching {len(candidates)} pages in parallel...')
     with ThreadPoolExecutor(max_workers=8) as pool:
         futures = {pool.submit(_fetch_article_text, a['link']): i
-                   for i, a in enumerate(articles)}
-        raw = [''] * len(articles)
+                   for i, a in enumerate(candidates)}
+        raw = [''] * len(candidates)
         for f in as_completed(futures):
             raw[futures[f]] = f.result()
+
     contents = [
-        raw[i][:3000] if len(raw[i]) > len(a['summary']) else a['summary']
-        for i, a in enumerate(articles)
+        raw[i][:2000] if len(raw[i]) > len(a['summary']) else a['summary']
+        for i, a in enumerate(candidates)
     ]
 
+    items = '\n\n'.join(
+        f"INDEX {i} [{a['source']}]: {a['title']}\n{contents[i]}"
+        for i, a in enumerate(candidates)
+    )
+
     if translate:
-        items = '\n\n'.join(
-            f"ARTICLE {i+1}\nFinnish title: {a['title']}\n{contents[i]}"
-            for i, a in enumerate(articles)
-        )
         prompt = (
-            f"Translate and summarize each of these {len(articles)} Finnish news articles "
-            f"to English in exactly 4 clear sentences each.\n"
-            f"Return a JSON array (one object per article) with keys "
-            f'"title" (English title) and "summary" (4-sentence English summary).\n'
-            f"Return ONLY valid JSON, no other text.\n\n{items}"
+            f"You are a news editor. From these {len(candidates)} Finnish news articles:\n"
+            f"1. Select the {top_n} most important and unique stories (remove duplicates)\n"
+            f"2. For each: translate title to English, write a 4-sentence English summary\n\n"
+            f"Return ONLY a JSON array in importance order:\n"
+            f'[{{"index":0,"title":"English title","title_orig":"Finnish title",'
+            f'"summary":"4 sentences","source":"source name"}}]\n\n{items}'
         )
     else:
-        items = '\n\n'.join(
-            f"ARTICLE {i+1}\nTitle: {a['title']}\n{contents[i]}"
-            for i, a in enumerate(articles)
-        )
         prompt = (
-            f"Summarize each of these {len(articles)} news articles "
-            f"in exactly 4 clear, informative sentences each.\n"
-            f"Return a JSON array (one object per article) with key "
-            f'"summary" (4-sentence summary).\n'
-            f"Return ONLY valid JSON, no other text.\n\n{items}"
+            f"You are a news editor. From these {len(candidates)} news articles:\n"
+            f"1. Select the {top_n} most important and unique stories (remove duplicates)\n"
+            f"2. For each: write a 4-sentence summary\n\n"
+            f"Return ONLY a JSON array in importance order:\n"
+            f'[{{"index":0,"title":"original title","summary":"4 sentences",'
+            f'"source":"source name"}}]\n\n{items}'
         )
 
     try:
+        print(f'  Calling Gemini for {section}...')
         text = _call(client, prompt)
-        # Strip markdown code fences if present
-        text = re.sub(r'^```(?:json)?\s*|\s*```$', '', text.strip())
-        parsed = json.loads(text)
+        parsed = parse_json_response(text)
         results = []
-        for i, a in enumerate(articles):
-            result = dict(a)
-            if i < len(parsed):
-                result['summary'] = parsed[i].get('summary', a['summary'])
-                if translate:
-                    result['title_orig']   = a['title']
-                    result['summary_orig'] = a['summary']
-                    result['title']        = parsed[i].get('title', a['title'])
-                    result['translated']   = True
+        for item in parsed[:top_n]:
+            idx = item.get('index', 0)
+            if not (0 <= idx < len(candidates)):
+                continue
+            orig = candidates[idx]
+            result = dict(orig)
+            result['title']   = item.get('title',   orig['title'])
+            result['summary'] = item.get('summary', orig['summary'])
+            result['source']  = item.get('source',  orig['source'])
+            if translate:
+                result['title_orig']   = item.get('title_orig', orig['title'])
+                result['summary_orig'] = orig['summary']
+                result['translated']   = True
             results.append(result)
+        print(f'  {section}: selected {len(results)} articles')
         return results
     except Exception as e:
-        print(f'[WARN] Batch summarize failed: {e}')
-        return articles
+        print(f'[WARN] {section} Gemini failed: {e}')
+        return candidates[:top_n]
 
 
 def fetch_social_buzz(client) -> str:
-    """Fetch top Reddit posts from Finnish communities and ask Gemini for themes."""
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 '
-                      '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'application/json',
-    }
+    """Fetch Reddit RSS via requests (browser headers), summarize themes with Gemini."""
     posts = []
-    for subreddit in ('Finland', 'Suomi'):
-        fetched = False
-        for base in ('https://www.reddit.com', 'https://old.reddit.com'):
-            try:
-                url = f'{base}/r/{subreddit}/top.json?t=day&limit=20'
-                resp = requests.get(url, headers=headers, timeout=15)
-                if not resp.text.strip():
-                    continue
-                data = resp.json()
-                titles = [child['data']['title']
-                          for child in data['data']['children']
-                          if not child['data'].get('stickied')]
-                for t in titles[:15]:
-                    posts.append(f'[r/{subreddit}] {t}')
-                print(f'[OK]   r/{subreddit}: {len(titles)} posts')
-                fetched = True
-                break
-            except Exception as e:
-                print(f'[WARN] r/{subreddit} ({base}): {e}')
-        if not fetched:
-            print(f'[WARN] r/{subreddit}: all sources failed')
+    for source, url in REDDIT_FEEDS:
+        try:
+            resp = requests.get(url, headers=BROWSER_HEADERS, timeout=10)
+            resp.raise_for_status()
+            feed = feedparser.parse(resp.text)
+            titles = [strip_html(e.get('title', '')) for e in feed.entries[:15]
+                      if e.get('title')]
+            for t in titles:
+                posts.append(f'[{source}] {t}')
+            print(f'[OK]   {source}: {len(titles)} posts')
+        except Exception as e:
+            print(f'[WARN] {source}: {e}')
 
     if not posts:
         return ''
 
     prompt = (
-        "These are today's top posts from Finnish Reddit communities (r/Finland and r/Suomi).\n"
-        "Identify the 5 most discussed themes and write 2-3 sentences about each, "
-        "describing what Finns are talking about today.\n"
+        "These are today's top posts from Finnish Reddit communities (r/Finland, r/Suomi).\n"
+        "Identify the 5 most discussed themes and write 2-3 sentences about each.\n"
         "Format as a numbered list with a bold theme title.\n\n"
         + '\n'.join(posts)
     )
@@ -269,7 +233,6 @@ def fetch_social_buzz(client) -> str:
 # ── RSS fetching ──────────────────────────────────────────────────────────────
 
 def fetch_candidates(feeds: list) -> list:
-    """Fetch raw RSS articles (no AI processing yet)."""
     articles, seen = [], set()
     for source, url in feeds:
         try:
@@ -334,7 +297,8 @@ def build_epub(finnish: list, global_news: list, buzz: str, label: str) -> str:
     chapters = [ch1, ch2]
 
     if buzz:
-        ch3 = make_chapter('Finnish Social Buzz', f'<div class="buzz">{buzz_to_html(buzz)}</div>', 'buzz.xhtml')
+        ch3 = make_chapter('Finnish Social Buzz',
+                            f'<div class="buzz">{buzz_to_html(buzz)}</div>', 'buzz.xhtml')
         chapters.append(ch3)
 
     book.toc   = chapters
@@ -375,7 +339,6 @@ def send_to_kindle(epub_path: str, label: str) -> None:
     part.add_header('Content-Disposition',
                     f'attachment; filename="{os.path.basename(epub_path)}"')
     msg.attach(part)
-
     _smtp_send(sender, password, recipient, msg)
 
 
@@ -389,7 +352,8 @@ def send_html_email(finnish: list, global_news: list, buzz: str, label: str) -> 
         if a.get('translated'):
             orig = (f'<div style="font-size:0.88em;color:#666;font-style:italic;'
                     f'margin-top:0.7em;border-left:3px solid #ddd;padding-left:0.8em">'
-                    f'<strong>Suomeksi:</strong> {a["title_orig"]}<br/>{a["summary_orig"]}</div>')
+                    f'<strong>Suomeksi:</strong> {a["title_orig"]}<br/>'
+                    f'{a["summary_orig"]}</div>')
         return (
             f'<div style="margin-bottom:1.8em;padding-bottom:1.5em;border-bottom:1px solid #ddd">'
             f'<h2 style="font-size:1.2em;margin:0 0 0.2em 0">{a["title"]}</h2>'
@@ -424,7 +388,6 @@ def send_html_email(finnish: list, global_news: list, buzz: str, label: str) -> 
     msg['To']      = recipient
     msg['Subject'] = f'News Digest {label}'
     msg.attach(MIMEText(body, 'html'))
-
     _smtp_send(sender, password, recipient, msg)
 
 
@@ -438,15 +401,13 @@ def main() -> None:
     finnish_cands = fetch_candidates(FEEDS['Finnish'])
     global_cands  = fetch_candidates(FEEDS['Global'])
 
-    print('Ranking articles...')
-    finnish     = rank_articles(client, finnish_cands, TOP_FINNISH, 'Finnish')
-    global_news = rank_articles(client, global_cands,  TOP_GLOBAL,  'global')
+    print('Processing Finnish news (rank + translate + summarize)...')
+    finnish = process_section(client, finnish_cands, TOP_FINNISH,
+                              'Finnish', translate=True)
 
-    print('Summarizing Finnish articles...')
-    finnish = summarize_batch(client, finnish, translate=True)
-
-    print('Summarizing global articles...')
-    global_news = summarize_batch(client, global_news, translate=False)
+    print('Processing global news (rank + summarize)...')
+    global_news = process_section(client, global_cands, TOP_GLOBAL,
+                                  'global', translate=False)
 
     print('Fetching social buzz...')
     buzz = fetch_social_buzz(client)
