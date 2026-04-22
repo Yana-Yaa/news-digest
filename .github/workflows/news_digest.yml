@@ -22,6 +22,7 @@ jobs:
       - name: Run digest
         run: python fetch_news.py
         env:
-          GMAIL_ADDRESS:     ${{ secrets.GMAIL_ADDRESS }}
+          GMAIL_ADDRESS:      ${{ secrets.GMAIL_ADDRESS }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
-          KINDLE_ADDRESS:    ${{ secrets.KINDLE_ADDRESS }}
+          KINDLE_ADDRESS:     ${{ secrets.KINDLE_ADDRESS }}
+          GEMINI_API_KEY:     ${{ secrets.GEMINI_API_KEY }}

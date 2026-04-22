@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Daily news digest — fetches RSS feeds, generates EPUB, emails to Kindle."""
+"""Daily news digest — fetches RSS feeds, ranks and summarizes with Gemini, emails to Kindle."""
 
 import feedparser
 import smtplib
@@ -7,15 +7,20 @@ import ssl
 import os
 import html
 import re
+import time
+import json
 from datetime import datetime
 from email import encoders
 from email.mime.base import MIMEBase
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from ebooklib import epub
+import trafilatura
+import google.generativeai as genai
 
-MAX_ARTICLES = 20
-MAX_PER_SOURCE = 4
+TOP_FINNISH    = 8
+TOP_GLOBAL     = 12
+FETCH_PER_SOURCE = 8   # fetch more candidates, Gemini picks the best
 
 FEEDS = {
     'Finnish': [
@@ -25,29 +30,39 @@ FEEDS = {
         ('Ilta-Sanomat',   'https://www.is.fi/rss/tuoreimmat.xml'),
     ],
     'Global': [
-        ('BBC',           'http://feeds.bbci.co.uk/news/rss.xml'),
-        ('Reuters',       'https://feeds.reuters.com/reuters/topNews'),
-        ('AP News',       'https://rsshub.app/apnews/topics/apf-topnews'),
-        ('The Guardian',  'https://www.theguardian.com/world/rss'),
-        ('Al Jazeera',    'https://www.aljazeera.com/xml/rss/all.xml'),
-        ('Deutsche Welle','https://rss.dw.com/rdf/rss-en-world'),
-        ('France 24',     'https://www.france24.com/en/rss'),
-        ('NPR',           'https://feeds.npr.org/1001/rss.xml'),
+        ('BBC',            'http://feeds.bbci.co.uk/news/rss.xml'),
+        ('Reuters',        'https://feeds.reuters.com/reuters/topNews'),
+        ('AP News',        'https://rsshub.app/apnews/topics/apf-topnews'),
+        ('The Guardian',   'https://www.theguardian.com/world/rss'),
+        ('Al Jazeera',     'https://www.aljazeera.com/xml/rss/all.xml'),
+        ('Deutsche Welle', 'https://rss.dw.com/rdf/rss-en-world'),
+        ('France 24',      'https://www.france24.com/en/rss'),
+        ('NPR',            'https://feeds.npr.org/1001/rss.xml'),
         ('Financial Times','https://www.ft.com/rss/home/uk'),
+    ],
+    'Social': [
+        ('r/Finland', 'https://www.reddit.com/r/Finland/top.rss?t=day'),
+        ('r/Suomi',   'https://www.reddit.com/r/Suomi/top.rss?t=day'),
     ],
 }
 
 CSS = '''
-body { font-family: Georgia, serif; margin: 1.5em; line-height: 1.75; color: #111; }
-h1   { font-size: 1.5em; border-bottom: 2px solid #222; padding-bottom: 0.3em; margin-bottom: 1em; }
-h2   { font-size: 1.1em; margin: 0 0 0.2em 0; }
-.meta    { color: #888; font-size: 0.85em; font-style: italic; margin: 0 0 0.5em 0; }
-.summary { margin: 0; }
-.readmore{ font-size: 0.85em; margin-top: 0.4em; }
-.article { margin-bottom: 2em; padding-bottom: 1.5em; border-bottom: 1px solid #ddd; }
+body { font-family: Georgia, serif; font-size: 1.15em; margin: 1.5em; line-height: 1.8; color: #111; }
+h1   { font-size: 1.6em; border-bottom: 2px solid #222; padding-bottom: 0.3em; margin-bottom: 1em; }
+h2   { font-size: 1.25em; margin: 0 0 0.2em 0; }
+h3   { font-size: 1.1em; margin: 1em 0 0.3em 0; color: #333; }
+.meta     { color: #888; font-size: 0.95em; font-style: italic; margin: 0 0 0.5em 0; }
+.summary  { margin: 0; font-size: 1em; }
+.original { font-size: 0.88em; color: #666; font-style: italic; margin-top: 0.7em;
+            border-left: 3px solid #ddd; padding-left: 0.8em; }
+.readmore { font-size: 0.95em; margin-top: 0.5em; }
+.article  { margin-bottom: 2em; padding-bottom: 1.5em; border-bottom: 1px solid #ddd; }
+.buzz     { line-height: 1.7; }
 a { color: #0055aa; }
 '''
 
+
+# ── helpers ──────────────────────────────────────────────────────────────────
 
 def strip_html(text: str) -> str:
     text = re.sub(r'<[^>]+>', ' ', text)
@@ -55,15 +70,153 @@ def strip_html(text: str) -> str:
     return html.unescape(text).strip()
 
 
-def fetch_section(feeds: list, max_total: int) -> list:
-    articles = []
-    seen = set()
+def buzz_to_html(text: str) -> str:
+    parts = []
+    for line in text.split('\n'):
+        line = line.strip()
+        if not line:
+            continue
+        # Bold **text** → <strong>
+        line = re.sub(r'\*\*(.+?)\*\*', r'<strong>\1</strong>', line)
+        if re.match(r'^\d+\.', line):
+            parts.append(f'<h3>{line}</h3>')
+        else:
+            parts.append(f'<p>{line}</p>')
+    return ''.join(parts)
+
+
+# ── Gemini ────────────────────────────────────────────────────────────────────
+
+def init_gemini() -> genai.GenerativeModel:
+    genai.configure(api_key=os.environ['GEMINI_API_KEY'])
+    return genai.GenerativeModel('gemini-1.5-flash')
+
+
+def _call(model, prompt: str) -> str:
+    time.sleep(1)   # stay under 15 RPM free tier
+    return model.generate_content(prompt).text.strip()
+
+
+def rank_articles(model, articles: list, top_n: int, section: str) -> list:
+    """One Gemini call: select top_n most important unique articles."""
+    lines = [f"{i}: {a['title']} — {a['summary'][:120]}"
+             for i, a in enumerate(articles)]
+    prompt = (
+        f"You are a news editor. From these {len(articles)} {section} articles "
+        f"select the {top_n} most important and unique stories. "
+        f"Merge duplicates (same event from multiple sources — keep one). "
+        f"Return ONLY a JSON array of integer indices in importance order, e.g. [3,0,7].\n\n"
+        + '\n'.join(lines)
+    )
+    try:
+        text = _call(model, prompt)
+        m = re.search(r'\[[\d,\s]+\]', text)
+        if m:
+            indices = json.loads(m.group())
+            seen, result = set(), []
+            for i in indices:
+                if i < len(articles) and i not in seen:
+                    seen.add(i)
+                    result.append(articles[i])
+            return result[:top_n]
+    except Exception as e:
+        print(f'[WARN] Ranking failed: {e}')
+    return articles[:top_n]
+
+
+def summarize(model, article: dict, translate: bool = False) -> dict:
+    """Fetch full article content and summarize (+ optionally translate) with Gemini."""
+    content = article['summary']
+    try:
+        downloaded = trafilatura.fetch_url(article['link'])
+        if downloaded:
+            full = trafilatura.extract(downloaded, include_comments=False,
+                                       include_tables=False, no_fallback=False)
+            if full and len(full) > len(content):
+                content = full[:5000]
+    except Exception:
+        pass
+
+    if translate:
+        prompt = (
+            "Translate this Finnish news article to English and summarize it in exactly "
+            "4 clear, informative sentences for a daily digest reader.\n"
+            "Respond in this exact format (nothing else):\n"
+            "TITLE: [English title]\n"
+            "SUMMARY: [4-sentence English summary]\n\n"
+            f"Finnish title: {article['title']}\n\n{content}"
+        )
+        try:
+            text = _call(model, prompt)
+            title_m   = re.search(r'TITLE:\s*(.+)',          text)
+            summary_m = re.search(r'SUMMARY:\s*([\s\S]+)', text)
+            result = dict(article)
+            result['title']        = title_m.group(1).strip()   if title_m   else article['title']
+            result['summary']      = summary_m.group(1).strip() if summary_m else text
+            result['title_orig']   = article['title']
+            result['summary_orig'] = article['summary']
+            result['translated']   = True
+            return result
+        except Exception as e:
+            print(f'[WARN] Summarize/translate failed for "{article["title"][:40]}": {e}')
+            return article
+    else:
+        prompt = (
+            "Summarize this news article in exactly 4 clear, informative sentences "
+            "for a daily digest reader. Be factual and capture the key points.\n\n"
+            f"Title: {article['title']}\n\n{content}"
+        )
+        try:
+            result = dict(article)
+            result['summary'] = _call(model, prompt)
+            return result
+        except Exception as e:
+            print(f'[WARN] Summarize failed for "{article["title"][:40]}": {e}')
+            return article
+
+
+def fetch_social_buzz(model) -> str:
+    """Fetch top Reddit posts from Finnish communities and ask Gemini for themes."""
+    posts = []
+    for source, url in FEEDS['Social']:
+        try:
+            feed = feedparser.parse(url, request_headers={'User-Agent': 'Mozilla/5.0'})
+            for entry in feed.entries[:15]:
+                title = strip_html(entry.get('title', ''))
+                if title:
+                    posts.append(f'[{source}] {title}')
+            print(f'[OK]   {source}: {len(feed.entries)} posts')
+        except Exception as e:
+            print(f'[WARN] {source}: {e}')
+
+    if not posts:
+        return ''
+
+    prompt = (
+        "These are today's top posts from Finnish Reddit communities (r/Finland and r/Suomi).\n"
+        "Identify the 5 most discussed themes and write 2-3 sentences about each, "
+        "describing what Finns are talking about today.\n"
+        "Format as a numbered list with a bold theme title.\n\n"
+        + '\n'.join(posts)
+    )
+    try:
+        return _call(model, prompt)
+    except Exception as e:
+        print(f'[WARN] Social buzz failed: {e}')
+        return ''
+
+
+# ── RSS fetching ──────────────────────────────────────────────────────────────
+
+def fetch_candidates(feeds: list) -> list:
+    """Fetch raw RSS articles (no AI processing yet)."""
+    articles, seen = [], set()
     for source, url in feeds:
         try:
             feed = feedparser.parse(url, request_headers={'User-Agent': 'Mozilla/5.0'})
             count = 0
             for entry in feed.entries:
-                if count >= MAX_PER_SOURCE:
+                if count >= FETCH_PER_SOURCE:
                     break
                 title   = strip_html(entry.get('title', ''))
                 summary = strip_html(entry.get('summary', entry.get('description', '')))
@@ -71,27 +224,35 @@ def fetch_section(feeds: list, max_total: int) -> list:
                 if not title or title in seen:
                     continue
                 seen.add(title)
-                articles.append({'title': title, 'summary': summary,
-                                  'link': link, 'source': source})
+                articles.append({'title': title, 'summary': summary, 'link': link,
+                                  'source': source, 'translated': False})
                 count += 1
-            print(f'[OK]   {source}: {count} articles')
+            print(f'[OK]   {source}: {count} candidates')
         except Exception as exc:
             print(f'[WARN] {source}: {exc}')
-    return articles[:max_total]
+    return articles
 
+
+# ── rendering ─────────────────────────────────────────────────────────────────
 
 def article_html(art: dict) -> str:
+    orig = ''
+    if art.get('translated'):
+        orig = (f'<p class="original">'
+                f'<strong>Suomeksi:</strong> {art["title_orig"]}<br/>'
+                f'{art["summary_orig"]}</p>')
     return (
         f'<div class="article">'
         f'<h2>{art["title"]}</h2>'
         f'<p class="meta">{art["source"]}</p>'
         f'<p class="summary">{art["summary"]}</p>'
+        f'{orig}'
         f'<p class="readmore"><a href="{art["link"]}">Full article →</a></p>'
         f'</div>'
     )
 
 
-def build_epub(finnish: list, global_news: list, label: str) -> str:
+def build_epub(finnish: list, global_news: list, buzz: str, label: str) -> str:
     book = epub.EpubBook()
     book.set_identifier(f'news-{label}')
     book.set_title(f'News Digest — {label}')
@@ -101,19 +262,23 @@ def build_epub(finnish: list, global_news: list, label: str) -> str:
                               media_type='text/css', content=CSS)
     book.add_item(css_item)
 
-    def make_chapter(title: str, articles: list, fname: str) -> epub.EpubHtml:
-        body = f'<h1>{title}</h1>' + ''.join(article_html(a) for a in articles)
+    def make_chapter(title: str, body_html: str, fname: str) -> epub.EpubHtml:
         ch = epub.EpubHtml(title=title, file_name=fname, lang='en')
-        ch.content = f'<html><body>{body}</body></html>'
+        ch.content = f'<html><body><h1>{title}</h1>{body_html}</body></html>'
         ch.add_item(css_item)
         book.add_item(ch)
         return ch
 
-    ch1 = make_chapter('Finnish News',  finnish,     'finnish.xhtml')
-    ch2 = make_chapter('Global News',   global_news, 'global.xhtml')
+    ch1 = make_chapter('Finnish News', ''.join(article_html(a) for a in finnish), 'finnish.xhtml')
+    ch2 = make_chapter('Global News',  ''.join(article_html(a) for a in global_news), 'global.xhtml')
+    chapters = [ch1, ch2]
 
-    book.toc   = [ch1, ch2]
-    book.spine = ['nav', ch1, ch2]
+    if buzz:
+        ch3 = make_chapter('Finnish Social Buzz', f'<div class="buzz">{buzz_to_html(buzz)}</div>', 'buzz.xhtml')
+        chapters.append(ch3)
+
+    book.toc   = chapters
+    book.spine = ['nav'] + chapters
     book.add_item(epub.EpubNcx())
     book.add_item(epub.EpubNav())
 
@@ -121,6 +286,8 @@ def build_epub(finnish: list, global_news: list, label: str) -> str:
     epub.write_epub(path, book)
     return path
 
+
+# ── email ─────────────────────────────────────────────────────────────────────
 
 def _smtp_send(sender: str, password: str, recipient: str, msg) -> None:
     ctx = ssl.create_default_context()
@@ -152,29 +319,43 @@ def send_to_kindle(epub_path: str, label: str) -> None:
     _smtp_send(sender, password, recipient, msg)
 
 
-def send_html_email(finnish: list, global_news: list, label: str) -> None:
+def send_html_email(finnish: list, global_news: list, buzz: str, label: str) -> None:
     sender    = os.environ['GMAIL_ADDRESS']
     password  = os.environ['GMAIL_APP_PASSWORD']
     recipient = os.environ['GMAIL_ADDRESS']
 
-    def section(title: str, articles: list) -> str:
-        items = ''.join(
+    def art_block(a: dict) -> str:
+        orig = ''
+        if a.get('translated'):
+            orig = (f'<div style="font-size:0.88em;color:#666;font-style:italic;'
+                    f'margin-top:0.7em;border-left:3px solid #ddd;padding-left:0.8em">'
+                    f'<strong>Suomeksi:</strong> {a["title_orig"]}<br/>{a["summary_orig"]}</div>')
+        return (
             f'<div style="margin-bottom:1.8em;padding-bottom:1.5em;border-bottom:1px solid #ddd">'
-            f'<h2 style="font-size:1.05em;margin:0 0 0.2em 0">{a["title"]}</h2>'
-            f'<p style="color:#888;font-size:0.85em;margin:0 0 0.4em 0">{a["source"]}</p>'
+            f'<h2 style="font-size:1.2em;margin:0 0 0.2em 0">{a["title"]}</h2>'
+            f'<p style="color:#888;font-size:0.95em;margin:0 0 0.4em 0">{a["source"]}</p>'
             f'<p style="margin:0">{a["summary"]}</p>'
-            f'<p style="margin:0.4em 0 0 0"><a href="{a["link"]}" style="color:#0055aa;font-size:0.85em">Full article →</a></p>'
+            f'{orig}'
+            f'<p style="margin:0.5em 0 0 0">'
+            f'<a href="{a["link"]}" style="color:#0055aa;font-size:0.95em">Full article →</a></p>'
             f'</div>'
-            for a in articles
         )
-        return (f'<h1 style="font-size:1.3em;border-bottom:2px solid #222;padding-bottom:0.3em">'
-                f'{title}</h1>{items}')
+
+    def section_html(title: str, inner: str) -> str:
+        return (f'<h1 style="font-size:1.5em;border-bottom:2px solid #222;'
+                f'padding-bottom:0.3em;margin-top:1.5em">{title}</h1>{inner}')
+
+    buzz_html = ''
+    if buzz:
+        buzz_html = section_html('Finnish Social Buzz',
+                                 f'<div style="line-height:1.8">{buzz_to_html(buzz)}</div>')
 
     body = (
-        f'<html><body style="font-family:Georgia,serif;max-width:700px;margin:auto;'
-        f'padding:1.5em;line-height:1.75;color:#111">'
-        f'{section("Finnish News", finnish)}'
-        f'{section("Global News", global_news)}'
+        f'<html><body style="font-family:Georgia,serif;font-size:18px;max-width:740px;'
+        f'margin:auto;padding:1.5em;line-height:1.8;color:#111">'
+        f'{section_html("Finnish News",  "".join(art_block(a) for a in finnish))}'
+        f'{section_html("Global News",   "".join(art_block(a) for a in global_news))}'
+        f'{buzz_html}'
         f'</body></html>'
     )
 
@@ -187,17 +368,35 @@ def send_html_email(finnish: list, global_news: list, label: str) -> None:
     _smtp_send(sender, password, recipient, msg)
 
 
+# ── main ──────────────────────────────────────────────────────────────────────
+
 def main() -> None:
-    label       = datetime.now().strftime('%Y-%m-%d %H%M')
-    finnish     = fetch_section(FEEDS['Finnish'], max_total=8)
-    global_news = fetch_section(FEEDS['Global'],  max_total=MAX_ARTICLES - len(finnish))
+    label = datetime.now().strftime('%Y-%m-%d %H%M')
+    model = init_gemini()
 
-    print(f'Finnish: {len(finnish)}, Global: {len(global_news)}')
+    print('Fetching candidates...')
+    finnish_cands = fetch_candidates(FEEDS['Finnish'])
+    global_cands  = fetch_candidates(FEEDS['Global'])
 
-    epub_path = build_epub(finnish, global_news, label)
+    print('Ranking articles...')
+    finnish     = rank_articles(model, finnish_cands, TOP_FINNISH, 'Finnish')
+    global_news = rank_articles(model, global_cands,  TOP_GLOBAL,  'global')
+
+    print('Summarizing Finnish articles...')
+    finnish = [summarize(model, a, translate=True) for a in finnish]
+
+    print('Summarizing global articles...')
+    global_news = [summarize(model, a, translate=False) for a in global_news]
+
+    print('Fetching social buzz...')
+    buzz = fetch_social_buzz(model)
+
+    print(f'Finnish: {len(finnish)}, Global: {len(global_news)}, Buzz: {bool(buzz)}')
+
+    epub_path = build_epub(finnish, global_news, buzz, label)
     send_to_kindle(epub_path, label)
     os.remove(epub_path)
-    send_html_email(finnish, global_news, label)
+    send_html_email(finnish, global_news, buzz, label)
     print('Done.')
 
 
