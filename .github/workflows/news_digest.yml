@@ -1,0 +1,27 @@
+name: News Digest
+
+on:
+  schedule:
+    - cron: '0 4 * * *'   # 07:00 Finland summer time (UTC+3)
+    - cron: '0 15 * * *'  # 18:00 Finland summer time (UTC+3)
+  workflow_dispatch:       # allow manual run from GitHub UI
+
+jobs:
+  digest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run digest
+        run: python fetch_news.py
+        env:
+          GMAIL_ADDRESS:     ${{ secrets.GMAIL_ADDRESS }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          KINDLE_ADDRESS:    ${{ secrets.KINDLE_ADDRESS }}

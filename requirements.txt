@@ -1,0 +1,3 @@
+feedparser>=6.0
+ebooklib>=0.18
+lxml>=5.0
