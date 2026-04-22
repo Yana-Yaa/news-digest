@@ -122,6 +122,14 @@ def build_epub(finnish: list, global_news: list, label: str) -> str:
     return path
 
 
+def _smtp_send(sender: str, password: str, recipient: str, msg) -> None:
+    ctx = ssl.create_default_context()
+    with smtplib.SMTP_SSL('smtp.gmail.com', 465, context=ctx) as server:
+        server.login(sender, password)
+        server.sendmail(sender, recipient, msg.as_string())
+    print(f'Sent to {recipient}')
+
+
 def send_to_kindle(epub_path: str, label: str) -> None:
     sender    = os.environ['GMAIL_ADDRESS']
     password  = os.environ['GMAIL_APP_PASSWORD']
@@ -141,11 +149,42 @@ def send_to_kindle(epub_path: str, label: str) -> None:
                     f'attachment; filename="{os.path.basename(epub_path)}"')
     msg.attach(part)
 
-    ctx = ssl.create_default_context()
-    with smtplib.SMTP_SSL('smtp.gmail.com', 465, context=ctx) as server:
-        server.login(sender, password)
-        server.sendmail(sender, recipient, msg.as_string())
-    print(f'Sent to {recipient}')
+    _smtp_send(sender, password, recipient, msg)
+
+
+def send_html_email(finnish: list, global_news: list, label: str) -> None:
+    sender    = os.environ['GMAIL_ADDRESS']
+    password  = os.environ['GMAIL_APP_PASSWORD']
+    recipient = os.environ['GMAIL_ADDRESS']
+
+    def section(title: str, articles: list) -> str:
+        items = ''.join(
+            f'<div style="margin-bottom:1.8em;padding-bottom:1.5em;border-bottom:1px solid #ddd">'
+            f'<h2 style="font-size:1.05em;margin:0 0 0.2em 0">{a["title"]}</h2>'
+            f'<p style="color:#888;font-size:0.85em;margin:0 0 0.4em 0">{a["source"]}</p>'
+            f'<p style="margin:0">{a["summary"]}</p>'
+            f'<p style="margin:0.4em 0 0 0"><a href="{a["link"]}" style="color:#0055aa;font-size:0.85em">Full article →</a></p>'
+            f'</div>'
+            for a in articles
+        )
+        return (f'<h1 style="font-size:1.3em;border-bottom:2px solid #222;padding-bottom:0.3em">'
+                f'{title}</h1>{items}')
+
+    body = (
+        f'<html><body style="font-family:Georgia,serif;max-width:700px;margin:auto;'
+        f'padding:1.5em;line-height:1.75;color:#111">'
+        f'{section("Finnish News", finnish)}'
+        f'{section("Global News", global_news)}'
+        f'</body></html>'
+    )
+
+    msg = MIMEMultipart('alternative')
+    msg['From']    = sender
+    msg['To']      = recipient
+    msg['Subject'] = f'News Digest {label}'
+    msg.attach(MIMEText(body, 'html'))
+
+    _smtp_send(sender, password, recipient, msg)
 
 
 def main() -> None:
@@ -158,6 +197,7 @@ def main() -> None:
     epub_path = build_epub(finnish, global_news, label)
     send_to_kindle(epub_path, label)
     os.remove(epub_path)
+    send_html_email(finnish, global_news, label)
     print('Done.')
 
 
