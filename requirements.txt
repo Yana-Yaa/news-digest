@@ -2,4 +2,4 @@ feedparser>=6.0
 ebooklib>=0.18
 lxml>=5.0
 trafilatura>=1.12
-google-generativeai>=0.8
+google-genai>=1.0

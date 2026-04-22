@@ -15,8 +15,9 @@ from email.mime.base import MIMEBase
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from ebooklib import epub
+import requests
 import trafilatura
-import google.generativeai as genai
+from google import genai
 
 TOP_FINNISH    = 8
 TOP_GLOBAL     = 12
@@ -87,17 +88,18 @@ def buzz_to_html(text: str) -> str:
 
 # ── Gemini ────────────────────────────────────────────────────────────────────
 
-def init_gemini() -> genai.GenerativeModel:
-    genai.configure(api_key=os.environ['GEMINI_API_KEY'])
-    return genai.GenerativeModel('gemini-1.5-flash')
+def init_gemini() -> genai.Client:
+    return genai.Client(api_key=os.environ['GEMINI_API_KEY'])
 
 
-def _call(model, prompt: str) -> str:
+def _call(client, prompt: str) -> str:
     time.sleep(1)   # stay under 15 RPM free tier
-    return model.generate_content(prompt).text.strip()
+    response = client.models.generate_content(
+        model='gemini-2.0-flash', contents=prompt)
+    return response.text.strip()
 
 
-def rank_articles(model, articles: list, top_n: int, section: str) -> list:
+def rank_articles(client, articles: list, top_n: int, section: str) -> list:
     """One Gemini call: select top_n most important unique articles."""
     lines = [f"{i}: {a['title']} — {a['summary'][:120]}"
              for i, a in enumerate(articles)]
@@ -109,7 +111,7 @@ def rank_articles(model, articles: list, top_n: int, section: str) -> list:
         + '\n'.join(lines)
     )
     try:
-        text = _call(model, prompt)
+        text = _call(client, prompt)
         m = re.search(r'\[[\d,\s]+\]', text)
         if m:
             indices = json.loads(m.group())
@@ -124,7 +126,7 @@ def rank_articles(model, articles: list, top_n: int, section: str) -> list:
     return articles[:top_n]
 
 
-def summarize(model, article: dict, translate: bool = False) -> dict:
+def summarize(client, article: dict, translate: bool = False) -> dict:
     """Fetch full article content and summarize (+ optionally translate) with Gemini."""
     content = article['summary']
     try:
@@ -147,7 +149,7 @@ def summarize(model, article: dict, translate: bool = False) -> dict:
             f"Finnish title: {article['title']}\n\n{content}"
         )
         try:
-            text = _call(model, prompt)
+            text = _call(client, prompt)
             title_m   = re.search(r'TITLE:\s*(.+)',          text)
             summary_m = re.search(r'SUMMARY:\s*([\s\S]+)', text)
             result = dict(article)
@@ -168,26 +170,30 @@ def summarize(model, article: dict, translate: bool = False) -> dict:
         )
         try:
             result = dict(article)
-            result['summary'] = _call(model, prompt)
+            result['summary'] = _call(client, prompt)
             return result
         except Exception as e:
             print(f'[WARN] Summarize failed for "{article["title"][:40]}": {e}')
             return article
 
 
-def fetch_social_buzz(model) -> str:
+def fetch_social_buzz(client) -> str:
     """Fetch top Reddit posts from Finnish communities and ask Gemini for themes."""
+    headers = {'User-Agent': 'news-digest-bot/1.0 (personal daily digest)'}
     posts = []
-    for source, url in FEEDS['Social']:
+    for subreddit in ('Finland', 'Suomi'):
         try:
-            feed = feedparser.parse(url, request_headers={'User-Agent': 'Mozilla/5.0'})
-            for entry in feed.entries[:15]:
-                title = strip_html(entry.get('title', ''))
-                if title:
-                    posts.append(f'[{source}] {title}')
-            print(f'[OK]   {source}: {len(feed.entries)} posts')
+            url = f'https://www.reddit.com/r/{subreddit}/top.json?t=day&limit=20'
+            resp = requests.get(url, headers=headers, timeout=15)
+            data = resp.json()
+            titles = [child['data']['title']
+                      for child in data['data']['children']
+                      if not child['data'].get('stickied')]
+            for t in titles[:15]:
+                posts.append(f'[r/{subreddit}] {t}')
+            print(f'[OK]   r/{subreddit}: {len(titles)} posts')
         except Exception as e:
-            print(f'[WARN] {source}: {e}')
+            print(f'[WARN] r/{subreddit}: {e}')
 
     if not posts:
         return ''
@@ -200,7 +206,7 @@ def fetch_social_buzz(model) -> str:
         + '\n'.join(posts)
     )
     try:
-        return _call(model, prompt)
+        return _call(client, prompt)
     except Exception as e:
         print(f'[WARN] Social buzz failed: {e}')
         return ''
@@ -371,25 +377,25 @@ def send_html_email(finnish: list, global_news: list, buzz: str, label: str) -> 
 # ── main ──────────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    label = datetime.now().strftime('%Y-%m-%d %H%M')
-    model = init_gemini()
+    label  = datetime.now().strftime('%Y-%m-%d %H%M')
+    client = init_gemini()
 
     print('Fetching candidates...')
     finnish_cands = fetch_candidates(FEEDS['Finnish'])
     global_cands  = fetch_candidates(FEEDS['Global'])
 
     print('Ranking articles...')
-    finnish     = rank_articles(model, finnish_cands, TOP_FINNISH, 'Finnish')
-    global_news = rank_articles(model, global_cands,  TOP_GLOBAL,  'global')
+    finnish     = rank_articles(client, finnish_cands, TOP_FINNISH, 'Finnish')
+    global_news = rank_articles(client, global_cands,  TOP_GLOBAL,  'global')
 
     print('Summarizing Finnish articles...')
-    finnish = [summarize(model, a, translate=True) for a in finnish]
+    finnish = [summarize(client, a, translate=True) for a in finnish]
 
     print('Summarizing global articles...')
-    global_news = [summarize(model, a, translate=False) for a in global_news]
+    global_news = [summarize(client, a, translate=False) for a in global_news]
 
     print('Fetching social buzz...')
-    buzz = fetch_social_buzz(model)
+    buzz = fetch_social_buzz(client)
 
     print(f'Finnish: {len(finnish)}, Global: {len(global_news)}, Buzz: {bool(buzz)}')
 
