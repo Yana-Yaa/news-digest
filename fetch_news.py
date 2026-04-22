@@ -157,47 +157,59 @@ def _fetch_article_text(url: str, retries: int = 2) -> str:
     return ''
 
 
-def summarize(client, article: dict, translate: bool = False) -> dict:
-    """Fetch full article content and summarize (+ optionally translate) with Gemini."""
-    full = _fetch_article_text(article['link'])
-    content = full[:5000] if len(full) > len(article['summary']) else article['summary']
+def summarize_batch(client, articles: list, translate: bool = False) -> list:
+    """Fetch all article texts, then summarize entire batch in ONE Gemini call."""
+    print(f'  Fetching {len(articles)} article pages...')
+    contents = []
+    for a in articles:
+        full = _fetch_article_text(a['link'])
+        contents.append(full[:3000] if len(full) > len(a['summary']) else a['summary'])
 
     if translate:
-        prompt = (
-            "Translate this Finnish news article to English and summarize it in exactly "
-            "4 clear, informative sentences for a daily digest reader.\n"
-            "Respond in this exact format (nothing else):\n"
-            "TITLE: [English title]\n"
-            "SUMMARY: [4-sentence English summary]\n\n"
-            f"Finnish title: {article['title']}\n\n{content}"
+        items = '\n\n'.join(
+            f"ARTICLE {i+1}\nFinnish title: {a['title']}\n{contents[i]}"
+            for i, a in enumerate(articles)
         )
-        try:
-            text = _call(client, prompt)
-            title_m   = re.search(r'TITLE:\s*(.+)',          text)
-            summary_m = re.search(r'SUMMARY:\s*([\s\S]+)', text)
-            result = dict(article)
-            result['title']        = title_m.group(1).strip()   if title_m   else article['title']
-            result['summary']      = summary_m.group(1).strip() if summary_m else text
-            result['title_orig']   = article['title']
-            result['summary_orig'] = article['summary']
-            result['translated']   = True
-            return result
-        except Exception as e:
-            print(f'[WARN] Summarize/translate failed for "{article["title"][:40]}": {e}')
-            return article
+        prompt = (
+            f"Translate and summarize each of these {len(articles)} Finnish news articles "
+            f"to English in exactly 4 clear sentences each.\n"
+            f"Return a JSON array (one object per article) with keys "
+            f'"title" (English title) and "summary" (4-sentence English summary).\n'
+            f"Return ONLY valid JSON, no other text.\n\n{items}"
+        )
     else:
-        prompt = (
-            "Summarize this news article in exactly 4 clear, informative sentences "
-            "for a daily digest reader. Be factual and capture the key points.\n\n"
-            f"Title: {article['title']}\n\n{content}"
+        items = '\n\n'.join(
+            f"ARTICLE {i+1}\nTitle: {a['title']}\n{contents[i]}"
+            for i, a in enumerate(articles)
         )
-        try:
-            result = dict(article)
-            result['summary'] = _call(client, prompt)
-            return result
-        except Exception as e:
-            print(f'[WARN] Summarize failed for "{article["title"][:40]}": {e}')
-            return article
+        prompt = (
+            f"Summarize each of these {len(articles)} news articles "
+            f"in exactly 4 clear, informative sentences each.\n"
+            f"Return a JSON array (one object per article) with key "
+            f'"summary" (4-sentence summary).\n'
+            f"Return ONLY valid JSON, no other text.\n\n{items}"
+        )
+
+    try:
+        text = _call(client, prompt)
+        # Strip markdown code fences if present
+        text = re.sub(r'^```(?:json)?\s*|\s*```$', '', text.strip())
+        parsed = json.loads(text)
+        results = []
+        for i, a in enumerate(articles):
+            result = dict(a)
+            if i < len(parsed):
+                result['summary'] = parsed[i].get('summary', a['summary'])
+                if translate:
+                    result['title_orig']   = a['title']
+                    result['summary_orig'] = a['summary']
+                    result['title']        = parsed[i].get('title', a['title'])
+                    result['translated']   = True
+            results.append(result)
+        return results
+    except Exception as e:
+        print(f'[WARN] Batch summarize failed: {e}')
+        return articles
 
 
 def fetch_social_buzz(client) -> str:
@@ -424,10 +436,10 @@ def main() -> None:
     global_news = rank_articles(client, global_cands,  TOP_GLOBAL,  'global')
 
     print('Summarizing Finnish articles...')
-    finnish = [summarize(client, a, translate=True) for a in finnish]
+    finnish = summarize_batch(client, finnish, translate=True)
 
     print('Summarizing global articles...')
-    global_news = [summarize(client, a, translate=False) for a in global_news]
+    global_news = summarize_batch(client, global_news, translate=False)
 
     print('Fetching social buzz...')
     buzz = fetch_social_buzz(client)
