@@ -104,23 +104,33 @@ def init_gemini() -> genai.Client:
     return genai.Client(api_key=os.environ['GEMINI_API_KEY'])
 
 
+MODELS = ['gemini-3.1-flash-lite', 'gemini-2.5-flash-lite', 'gemini-2.5-flash']
+
+
 def _call(client, prompt: str) -> str:
     time.sleep(5)
-    for attempt in range(3):
-        try:
-            response = client.models.generate_content(
-                model='gemini-2.0-flash-lite', contents=prompt)
-            return response.text.strip()
-        except Exception as e:
-            msg = str(e)
-            if '429' in msg:
-                m = re.search(r'"retryDelay":\s*"(\d+)s"', msg)
-                wait = int(m.group(1)) + 5 if m else 30
-                print(f'[RATE LIMIT] waiting {wait}s (attempt {attempt+1}/3)...')
-                time.sleep(wait)
-            else:
-                raise
-    raise RuntimeError('Gemini: too many rate limit retries')
+    for model in MODELS:
+        for attempt in range(2):
+            try:
+                response = client.models.generate_content(
+                    model=model, contents=prompt)
+                print(f'  [Gemini OK] model={model}')
+                return response.text.strip()
+            except Exception as e:
+                msg = str(e)
+                if '429' in msg:
+                    m = re.search(r'"retryDelay":\s*"(\d+)s"', msg)
+                    wait = int(m.group(1)) + 5 if m else 30
+                    print(f'  [RATE LIMIT] {model} attempt {attempt+1}, waiting {wait}s...')
+                    time.sleep(wait)
+                else:
+                    print(f'  [ERROR] {model}: {msg[:120]}')
+                    break  # non-rate-limit error, try next model
+        else:
+            continue  # both attempts rate-limited, try next model
+        break  # success
+    else:
+        raise RuntimeError('All Gemini models rate-limited')
 
 
 def _fetch_article_text(url: str) -> str:
