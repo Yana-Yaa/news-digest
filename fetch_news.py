@@ -138,18 +138,29 @@ def rank_articles(client, articles: list, top_n: int, section: str) -> list:
     return articles[:top_n]
 
 
+def _fetch_article_text(url: str, retries: int = 2) -> str:
+    """Download article with timeout and extract clean text. Retries on connection errors."""
+    for attempt in range(retries + 1):
+        try:
+            resp = requests.get(url, timeout=8,
+                                headers={'User-Agent': 'Mozilla/5.0'})
+            text = trafilatura.extract(resp.text, include_comments=False,
+                                       include_tables=False, no_fallback=False)
+            return text or ''
+        except requests.exceptions.Timeout:
+            return ''   # no point retrying a slow site
+        except requests.exceptions.ConnectionError:
+            if attempt < retries:
+                time.sleep(2)
+        except Exception:
+            return ''
+    return ''
+
+
 def summarize(client, article: dict, translate: bool = False) -> dict:
     """Fetch full article content and summarize (+ optionally translate) with Gemini."""
-    content = article['summary']
-    try:
-        downloaded = trafilatura.fetch_url(article['link'])
-        if downloaded:
-            full = trafilatura.extract(downloaded, include_comments=False,
-                                       include_tables=False, no_fallback=False)
-            if full and len(full) > len(content):
-                content = full[:5000]
-    except Exception:
-        pass
+    full = _fetch_article_text(article['link'])
+    content = full[:5000] if len(full) > len(article['summary']) else article['summary']
 
     if translate:
         prompt = (
