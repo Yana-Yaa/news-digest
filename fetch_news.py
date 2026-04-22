@@ -93,10 +93,22 @@ def init_gemini() -> genai.Client:
 
 
 def _call(client, prompt: str) -> str:
-    time.sleep(1)   # stay under 15 RPM free tier
-    response = client.models.generate_content(
-        model='gemini-2.0-flash', contents=prompt)
-    return response.text.strip()
+    for attempt in range(3):
+        try:
+            time.sleep(4)   # 15 RPM = 1 req/4s
+            response = client.models.generate_content(
+                model='gemini-2.0-flash-lite', contents=prompt)
+            return response.text.strip()
+        except Exception as e:
+            msg = str(e)
+            if '429' in msg and 'retryDelay' in msg:
+                m = re.search(r'"retryDelay":\s*"(\d+)s"', msg)
+                wait = int(m.group(1)) + 5 if m else 60
+                print(f'[RATE LIMIT] waiting {wait}s...')
+                time.sleep(wait)
+            else:
+                raise
+    raise RuntimeError('Gemini rate limit: too many retries')
 
 
 def rank_articles(client, articles: list, top_n: int, section: str) -> list:
@@ -179,21 +191,33 @@ def summarize(client, article: dict, translate: bool = False) -> dict:
 
 def fetch_social_buzz(client) -> str:
     """Fetch top Reddit posts from Finnish communities and ask Gemini for themes."""
-    headers = {'User-Agent': 'news-digest-bot/1.0 (personal daily digest)'}
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 '
+                      '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'application/json',
+    }
     posts = []
     for subreddit in ('Finland', 'Suomi'):
-        try:
-            url = f'https://www.reddit.com/r/{subreddit}/top.json?t=day&limit=20'
-            resp = requests.get(url, headers=headers, timeout=15)
-            data = resp.json()
-            titles = [child['data']['title']
-                      for child in data['data']['children']
-                      if not child['data'].get('stickied')]
-            for t in titles[:15]:
-                posts.append(f'[r/{subreddit}] {t}')
-            print(f'[OK]   r/{subreddit}: {len(titles)} posts')
-        except Exception as e:
-            print(f'[WARN] r/{subreddit}: {e}')
+        fetched = False
+        for base in ('https://www.reddit.com', 'https://old.reddit.com'):
+            try:
+                url = f'{base}/r/{subreddit}/top.json?t=day&limit=20'
+                resp = requests.get(url, headers=headers, timeout=15)
+                if not resp.text.strip():
+                    continue
+                data = resp.json()
+                titles = [child['data']['title']
+                          for child in data['data']['children']
+                          if not child['data'].get('stickied')]
+                for t in titles[:15]:
+                    posts.append(f'[r/{subreddit}] {t}')
+                print(f'[OK]   r/{subreddit}: {len(titles)} posts')
+                fetched = True
+                break
+            except Exception as e:
+                print(f'[WARN] r/{subreddit} ({base}): {e}')
+        if not fetched:
+            print(f'[WARN] r/{subreddit}: all sources failed')
 
     if not posts:
         return ''
