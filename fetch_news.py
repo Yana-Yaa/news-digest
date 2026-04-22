@@ -9,6 +9,7 @@ import html
 import re
 import time
 import json
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from email import encoders
 from email.mime.base import MIMEBase
@@ -142,7 +143,7 @@ def _fetch_article_text(url: str, retries: int = 2) -> str:
     """Download article with timeout and extract clean text. Retries on connection errors."""
     for attempt in range(retries + 1):
         try:
-            resp = requests.get(url, timeout=8,
+            resp = requests.get(url, timeout=5,
                                 headers={'User-Agent': 'Mozilla/5.0'})
             text = trafilatura.extract(resp.text, include_comments=False,
                                        include_tables=False, no_fallback=False)
@@ -159,11 +160,17 @@ def _fetch_article_text(url: str, retries: int = 2) -> str:
 
 def summarize_batch(client, articles: list, translate: bool = False) -> list:
     """Fetch all article texts, then summarize entire batch in ONE Gemini call."""
-    print(f'  Fetching {len(articles)} article pages...')
-    contents = []
-    for a in articles:
-        full = _fetch_article_text(a['link'])
-        contents.append(full[:3000] if len(full) > len(a['summary']) else a['summary'])
+    print(f'  Fetching {len(articles)} article pages in parallel...')
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = {pool.submit(_fetch_article_text, a['link']): i
+                   for i, a in enumerate(articles)}
+        raw = [''] * len(articles)
+        for f in as_completed(futures):
+            raw[futures[f]] = f.result()
+    contents = [
+        raw[i][:3000] if len(raw[i]) > len(a['summary']) else a['summary']
+        for i, a in enumerate(articles)
+    ]
 
     if translate:
         items = '\n\n'.join(
