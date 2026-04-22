@@ -175,6 +175,7 @@ def process_section(client, candidates: list, top_n: int,
     try:
         print(f'  Calling Gemini for {section}...')
         text = _call(client, prompt)
+        print(f'  Gemini response ({len(text)} chars): {text[:300]}')
         parsed = parse_json_response(text)
         results = []
         for item in parsed[:top_n]:
@@ -409,8 +410,9 @@ def main() -> None:
     global_news = process_section(client, global_cands, TOP_GLOBAL,
                                   'global', translate=False)
 
-    print('Fetching social buzz...')
-    buzz = fetch_social_buzz(client)
+    # Social buzz disabled until Reddit blocking from GitHub Actions is resolved
+    buzz = ''
+    # buzz = fetch_social_buzz(client)
 
     print(f'Finnish: {len(finnish)}, Global: {len(global_news)}, Buzz: {bool(buzz)}')
 
