@@ -3,7 +3,6 @@ name: News Digest
 on:
   schedule:
     - cron: '0 4 * * *'   # 07:00 Finland summer time (UTC+3)
-    - cron: '0 15 * * *'  # 18:00 Finland summer time (UTC+3)
   workflow_dispatch:       # allow manual run from GitHub UI
 
 jobs:
@@ -27,3 +26,4 @@ jobs:
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
           KINDLE_ADDRESS:     ${{ secrets.KINDLE_ADDRESS }}
           GEMINI_API_KEY:     ${{ secrets.GEMINI_API_KEY }}
+          EXTRA_EMAIL:        ${{ secrets.EXTRA_EMAIL }}

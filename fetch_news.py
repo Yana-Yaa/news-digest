@@ -173,7 +173,9 @@ def process_section(client, candidates: list, top_n: int,
         prompt = (
             f"You are a news editor. From these {len(candidates)} news articles:\n"
             f"1. Select the {top_n} most important and unique stories (remove duplicates)\n"
-            f"2. For each: write a 4-sentence summary\n\n"
+            f"2. Only include international/global stories — skip local or national news "
+            f"(e.g. UK domestic politics, US local events, country-specific sports)\n"
+            f"3. For each: write a 4-sentence summary\n\n"
             f"Return ONLY a JSON array in importance order:\n"
             f'[{{"index":0,"title":"original title","summary":"4 sentences",'
             f'"source":"source name"}}]\n\n{items}'
@@ -321,7 +323,7 @@ def build_epub(finnish: list, global_news: list, buzz: str, label: str) -> str:
 
 # ── email ─────────────────────────────────────────────────────────────────────
 
-def _smtp_send(sender: str, password: str, recipient: str, msg) -> None:
+def _smtp_send(sender: str, password: str, recipient, msg) -> None:
     ctx = ssl.create_default_context()
     with smtplib.SMTP_SSL('smtp.gmail.com', 465, context=ctx) as server:
         server.login(sender, password)
@@ -351,9 +353,12 @@ def send_to_kindle(epub_path: str, label: str) -> None:
 
 
 def send_html_email(finnish: list, global_news: list, buzz: str, label: str) -> None:
-    sender    = os.environ['GMAIL_ADDRESS']
-    password  = os.environ['GMAIL_APP_PASSWORD']
-    recipient = os.environ['GMAIL_ADDRESS']
+    sender     = os.environ['GMAIL_ADDRESS']
+    password   = os.environ['GMAIL_APP_PASSWORD']
+    recipients = [os.environ['GMAIL_ADDRESS']]
+    extra      = os.environ.get('EXTRA_EMAIL', '')
+    if extra:
+        recipients.append(extra)
 
     def art_block(a: dict) -> str:
         orig = ''
@@ -393,10 +398,10 @@ def send_html_email(finnish: list, global_news: list, buzz: str, label: str) -> 
 
     msg = MIMEMultipart('alternative')
     msg['From']    = sender
-    msg['To']      = recipient
+    msg['To']      = ', '.join(recipients)
     msg['Subject'] = f'News Digest {label}'
     msg.attach(MIMEText(body, 'html'))
-    _smtp_send(sender, password, recipient, msg)
+    _smtp_send(sender, password, recipients, msg)
 
 
 # ── main ──────────────────────────────────────────────────────────────────────
