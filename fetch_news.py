@@ -384,9 +384,9 @@ def send_html_email(finnish: list, global_news: list, buzz: str, label: str) -> 
     sender     = os.environ['GMAIL_ADDRESS']
     password   = os.environ['GMAIL_APP_PASSWORD']
     recipients = [os.environ['GMAIL_ADDRESS']]
-    # extra      = os.environ.get('EXTRA_EMAIL', '')
-    # if extra:
-    #     recipients.append(extra)
+    extra      = os.environ.get('EXTRA_EMAIL', '')
+    if extra:
+        recipients.append(extra)
 
     def art_block(a: dict) -> str:
         orig = ''
