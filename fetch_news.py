@@ -153,7 +153,10 @@ def process_section(client, candidates: list, top_n: int,
     rank_prompt = (
         f"You are a news editor. From these {len(candidates)} "
         f"{'Finnish ' if translate else ''}news articles, "
-        f"select the {top_n} most important and unique stories (remove duplicates).\n"
+        f"select the {top_n} most important and unique stories.\n"
+        f"DEDUPLICATION IS CRITICAL: if multiple articles cover the same event or topic "
+        f"(even from different sources), keep ONLY the single best one. "
+        f"Two articles about the same story = pick one, drop the rest.\n"
         + (
             "Prefer international/global stories. Skip purely local news "
             "(local crime, regional weather, domestic politics, country-specific sports). "
