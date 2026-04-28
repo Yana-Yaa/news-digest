@@ -46,7 +46,9 @@ FEEDS = {
         ('Deutsche Welle', 'https://rss.dw.com/rdf/rss-en-world'),
         ('France 24',      'https://www.france24.com/en/rss'),
         ('NPR',            'https://feeds.npr.org/1001/rss.xml'),
-        ('Financial Times','https://www.ft.com/rss/home/uk'),
+        ('Financial Times', 'https://www.ft.com/rss/home/uk'),
+        ('Ars Technica',    'https://feeds.arstechnica.com/arstechnica/index'),
+        ('TechCrunch',      'https://techcrunch.com/feed/'),
     ],
 }
 
@@ -141,71 +143,97 @@ def _fetch_article_text(url: str) -> str:
 
 def process_section(client, candidates: list, top_n: int,
                     section: str, translate: bool = False) -> list:
-    """Fetch article content, then rank + summarize in ONE Gemini call."""
-    print(f'  Fetching {len(candidates)} pages in parallel...')
-    with ThreadPoolExecutor(max_workers=8) as pool:
-        futures = {pool.submit(_fetch_article_text, a['link']): i
-                   for i, a in enumerate(candidates)}
-        raw = [''] * len(candidates)
-        for f in as_completed(futures):
-            raw[futures[f]] = f.result()
+    """Two Gemini calls: first rank (returns indices), then summarize in-order (no index mix-up)."""
 
-    contents = [
-        raw[i][:2000] if len(raw[i]) > len(a['summary']) else a['summary']
-        for i, a in enumerate(candidates)
-    ]
-
-    items = '\n\n'.join(
-        f"INDEX {i} [{a['source']}]: {a['title']}\n{contents[i]}"
+    # ── Call 1: rank and select ───────────────────────────────────────────────
+    lines = '\n'.join(
+        f"{i}: [{a['source']}] {a['title']} — {a['summary'][:100]}"
         for i, a in enumerate(candidates)
     )
+    rank_prompt = (
+        f"You are a news editor. From these {len(candidates)} "
+        f"{'Finnish ' if translate else ''}news articles, "
+        f"select the {top_n} most important and unique stories (remove duplicates).\n"
+        + (
+            "Prefer international/global stories. Skip purely local news "
+            "(local crime, regional weather, domestic politics, country-specific sports). "
+            "Always include: major tech, science, business, geopolitics, wars, economic policy, "
+            "and news about global companies (Apple, Google, Tesla, major banks, etc.).\n"
+            if not translate else ""
+        ) +
+        f"Return ONLY a JSON array of integer indices in importance order, e.g. [3,0,7].\n\n"
+        + lines
+    )
+    try:
+        print(f'  Calling Gemini to rank {section}...')
+        text = _call(client, rank_prompt)
+        m = re.search(r'\[[\d,\s]+\]', text)
+        indices = json.loads(m.group()) if m else list(range(min(top_n, len(candidates))))
+        seen, selected = set(), []
+        for i in indices:
+            if 0 <= i < len(candidates) and i not in seen:
+                seen.add(i)
+                selected.append(candidates[i])
+        selected = selected[:top_n]
+        print(f'  Ranked: {len(selected)} articles selected')
+    except Exception as e:
+        print(f'[WARN] {section} ranking failed: {e}')
+        selected = candidates[:top_n]
 
+    # ── Fetch article content for selected articles ───────────────────────────
+    print(f'  Fetching {len(selected)} pages in parallel...')
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = {pool.submit(_fetch_article_text, a['link']): i
+                   for i, a in enumerate(selected)}
+        raw = [''] * len(selected)
+        for f in as_completed(futures):
+            raw[futures[f]] = f.result()
+    contents = [
+        raw[i][:2000] if len(raw[i]) > len(a['summary']) else a['summary']
+        for i, a in enumerate(selected)
+    ]
+
+    # ── Call 2: summarize in-order (position N → article N, no index ambiguity) ──
+    items = '\n\n'.join(
+        f"ARTICLE {i+1}\n{'Finnish title' if translate else 'Title'}: {a['title']}\n{contents[i]}"
+        for i, a in enumerate(selected)
+    )
     if translate:
-        prompt = (
-            f"You are a news editor. From these {len(candidates)} Finnish news articles:\n"
-            f"1. Select the {top_n} most important and unique stories (remove duplicates)\n"
-            f"2. For each: translate title to English, write a 4-sentence English summary\n\n"
-            f"Return ONLY a JSON array in importance order:\n"
-            f'[{{"index":0,"title":"English title","title_orig":"Finnish title",'
-            f'"summary":"4 sentences","source":"source name"}}]\n\n{items}'
+        sum_prompt = (
+            f"Translate and summarize each of these {len(selected)} Finnish news articles "
+            f"to English in exactly 4 clear sentences each.\n"
+            f"Return a JSON array with one object per article IN THE SAME ORDER, keys: "
+            f'"title" (English title), "title_orig" (original Finnish title), "summary".\n'
+            f"Return ONLY valid JSON.\n\n{items}"
         )
     else:
-        prompt = (
-            f"You are a news editor. From these {len(candidates)} news articles:\n"
-            f"1. Select the {top_n} most important and unique stories (remove duplicates)\n"
-            f"2. Only include international/global stories — skip local or national news "
-            f"(e.g. UK domestic politics, US local events, country-specific sports)\n"
-            f"3. For each: write a 4-sentence summary\n\n"
-            f"Return ONLY a JSON array in importance order:\n"
-            f'[{{"index":0,"title":"original title","summary":"4 sentences",'
-            f'"source":"source name"}}]\n\n{items}'
+        sum_prompt = (
+            f"Summarize each of these {len(selected)} news articles "
+            f"in exactly 4 clear sentences each.\n"
+            f"Return a JSON array with one object per article IN THE SAME ORDER, key: "
+            f'"summary" only.\n'
+            f"Return ONLY valid JSON.\n\n{items}"
         )
-
     try:
-        print(f'  Calling Gemini for {section}...')
-        text = _call(client, prompt)
-        print(f'  Gemini response ({len(text)} chars): {text[:300]}')
+        print(f'  Calling Gemini to summarize {section}...')
+        text = _call(client, sum_prompt)
         parsed = parse_json_response(text)
         results = []
-        for item in parsed[:top_n]:
-            idx = item.get('index', 0)
-            if not (0 <= idx < len(candidates)):
-                continue
-            orig = candidates[idx]
-            result = dict(orig)
-            result['title']   = item.get('title',   orig['title'])
-            result['summary'] = item.get('summary', orig['summary'])
-            result['source']  = item.get('source',  orig['source'])
-            if translate:
-                result['title_orig']   = item.get('title_orig', orig['title'])
-                result['summary_orig'] = orig['summary']
-                result['translated']   = True
+        for i, a in enumerate(selected):
+            result = dict(a)
+            if i < len(parsed):
+                result['summary'] = parsed[i].get('summary', a['summary'])
+                if translate:
+                    result['title_orig']   = parsed[i].get('title_orig', a['title'])
+                    result['summary_orig'] = a['summary']
+                    result['title']        = parsed[i].get('title', a['title'])
+                    result['translated']   = True
             results.append(result)
-        print(f'  {section}: selected {len(results)} articles')
+        print(f'  {section}: {len(results)} articles summarized')
         return results
     except Exception as e:
-        print(f'[WARN] {section} Gemini failed: {e}')
-        return candidates[:top_n]
+        print(f'[WARN] {section} summarize failed: {e}')
+        return selected
 
 
 def fetch_social_buzz(client) -> str:
